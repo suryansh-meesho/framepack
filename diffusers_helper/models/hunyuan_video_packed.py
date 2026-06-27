@@ -1040,8 +1040,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                 self.previous_residual = hidden_states - ori_hidden_states
         else:
             for block in self.transformer_blocks:
-                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                    block,
+                hidden_states, encoder_hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,
                     temb,
@@ -1050,8 +1049,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                 )
 
             for block in self.single_transformer_blocks:
-                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                    block,
+                hidden_states, encoder_hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,
                     temb,

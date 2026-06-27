@@ -44,10 +44,12 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
           f'{llama_attention_length} real tokens (rest is padding)')
 
     print(f'        [encode_prompt] Running LLaMA forward pass (this streams layers through GPU via DynamicSwap)...')
+    text_encoder.config.output_hidden_states=True
     llama_outputs = text_encoder(
         input_ids=llama_input_ids,
         attention_mask=llama_attention_mask,
         output_hidden_states=True,
+        return_dict=True
     )
 
     # Extract 3rd-to-last hidden state, cropped to skip system-prompt tokens.
@@ -56,6 +58,7 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
     num_layers = len(llama_outputs.hidden_states)
     print(f'        [encode_prompt] LLaMA returned {num_layers} hidden state layers, using layer [{num_layers - 3}] (3rd from last)')
     llama_vec = llama_outputs.hidden_states[-3][:, crop_start:llama_attention_length]
+    llama_attention_mask = llama_attention_mask[:, crop_start:llama_attention_length]
     print(f'        [encode_prompt] Cropped from position {crop_start} to {llama_attention_length} -> shape {llama_vec.shape}')
 
     # CLIP -- produces a single 768-dim "pooler_output" that summarizes the entire
