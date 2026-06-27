@@ -35,17 +35,26 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=1.0):
 #      clean), but the sampler expects x0 (the clean image estimate).
 #      Formula: x0 = noisy_input - velocity * sigma (noise level)
 def fm_wrapper(transformer, t_scale=1000.0):
+    _call_count = [0]  # mutable counter inside closure
+
     def k_model(x, sigma, **extra_args):
         dtype = extra_args['dtype']
         cfg_scale = extra_args['cfg_scale']
         cfg_rescale = extra_args['cfg_rescale']
+        _call_count[0] += 1
 
         original_dtype = x.dtype
         sigma = sigma.float()
+        sigma_val = sigma[0].item() if sigma.dim() > 0 else sigma.item()
 
         x = x.to(dtype)
         # Convert sigma (0..1 range) to timestep (0..1000 range) as expected by the model
         timestep = (sigma * t_scale).to(dtype)
+
+        if _call_count[0] <= 2:  # only print details for first 2 calls to avoid spam
+            print(f'          [fm_wrapper] Call #{_call_count[0]}: sigma={sigma_val:.4f}, '
+                  f'timestep={sigma_val * t_scale:.1f}, input={x.shape}')
+            print(f'          [fm_wrapper] Running transformer POSITIVE pass (with text conditioning)...')
 
         # Forward pass WITH text conditioning (the "positive" prediction)
         pred_positive = transformer(hidden_states=x, timestep=timestep, return_dict=False, **extra_args['positive'])[0].float()
@@ -54,7 +63,11 @@ def fm_wrapper(transformer, t_scale=1000.0):
         # When cfg_scale=1, skip the negative pass entirely (no guidance needed)
         if cfg_scale == 1.0:
             pred_negative = torch.zeros_like(pred_positive)
+            if _call_count[0] <= 2:
+                print(f'          [fm_wrapper] CFG=1.0, skipping negative pass (using zeros)')
         else:
+            if _call_count[0] <= 2:
+                print(f'          [fm_wrapper] Running transformer NEGATIVE pass (without text)...')
             pred_negative = transformer(hidden_states=x, timestep=timestep, return_dict=False, **extra_args['negative'])[0].float()
 
         # Apply Classifier-Free Guidance:
@@ -67,6 +80,11 @@ def fm_wrapper(transformer, t_scale=1000.0):
         #   x_noisy = x_clean + sigma * v
         # Therefore: x_clean = x_noisy - sigma * v
         x0 = x.float() - pred.float() * append_dims(sigma, x.ndim)
+
+        if _call_count[0] <= 2:
+            print(f'          [fm_wrapper] Velocity -> x0 conversion done. Output: {x0.shape}')
+            if _call_count[0] == 2:
+                print(f'          [fm_wrapper] (suppressing further per-call prints to reduce noise)')
 
         return x0.to(dtype=original_dtype)
 

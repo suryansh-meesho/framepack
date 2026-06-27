@@ -76,16 +76,24 @@ def sample_hunyuan(
     # Generate pure random noise as the starting point for denoising.
     # Shape: [batch, 16 latent channels, (frames+3)//4 time steps, height//8, width//8]
     # The //4 and //8 account for the VAE's compression factors (4x temporal, 8x spatial).
+    print(f'        [sample_hunyuan] Generating random noise: batch={batch_size}, channels=16, '
+          f'frames={(frames+3)//4}, h={height//8}, w={width//8}')
     latents = torch.randn((batch_size, 16, (frames + 3) // 4, height // 8, width // 8), generator=generator, device=generator.device).to(device=device, dtype=torch.float32)
+    print(f'        [sample_hunyuan] Initial noise shape: {latents.shape}')
 
     _, _, T, H, W = latents.shape
     seq_length = T * H * W // 4
+    print(f'        [sample_hunyuan] Sequence length for schedule: {seq_length} tokens (T={T} x H={H} x W={W} / 4)')
 
     mu = calculate_flux_mu(seq_length, exp_max=7.0)
     sigmas = get_flux_sigmas_from_mu(num_inference_steps, mu).to(device)
+    print(f'        [sample_hunyuan] Noise schedule: mu={mu:.3f}, {len(sigmas)} sigma values')
+    print(f'        [sample_hunyuan] Sigma range: {sigmas[0]:.4f} (noisy) -> {sigmas[-1]:.4f} (clean)')
 
+    print(f'        [sample_hunyuan] Wrapping transformer with CFG logic (fm_wrapper)...')
     k_model = fm_wrapper(transformer)
 
+    print(f'        [sample_hunyuan] Distilled guidance scale: {distilled_guidance_scale} (embedded in model, x1000 = {distilled_guidance_scale * 1000})')
     distilled_guidance = torch.tensor([distilled_guidance_scale * 1000.0] * batch_size).to(device=device, dtype=dtype)
 
     prompt_embeds = repeat_to_batch_size(prompt_embeds, batch_size)

@@ -13,7 +13,11 @@ def hf_clip_vision_encode(image, feature_extractor, image_encoder):
     assert image.ndim == 3 and image.shape[2] == 3
     assert image.dtype == np.uint8
 
+    print(f'        [clip_vision] Preprocessing image {image.shape} -> resize to model input size, normalize...')
     preprocessed = feature_extractor.preprocess(images=image, return_tensors="pt").to(device=image_encoder.device, dtype=image_encoder.dtype)
+    print(f'        [clip_vision] Preprocessed tensor: {preprocessed["pixel_values"].shape}, dtype={preprocessed["pixel_values"].dtype}')
+    print(f'        [clip_vision] Running SigLIP vision transformer (splits image into patches, processes each)...')
     image_encoder_output = image_encoder(**preprocessed)
+    print(f'        [clip_vision] Output last_hidden_state: {image_encoder_output.last_hidden_state.shape}')
 
     return image_encoder_output

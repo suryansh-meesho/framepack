@@ -24,6 +24,7 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
 
     prompt_llama = [DEFAULT_PROMPT_TEMPLATE["template"].format(p) for p in prompt]
     crop_start = DEFAULT_PROMPT_TEMPLATE["crop_start"]
+    print(f'        [encode_prompt] Wrapped prompt in template, crop_start={crop_start}')
 
     llama_inputs = tokenizer(
         prompt_llama,
@@ -39,7 +40,10 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
     llama_input_ids = llama_inputs.input_ids.to(text_encoder.device)
     llama_attention_mask = llama_inputs.attention_mask.to(text_encoder.device)
     llama_attention_length = int(llama_attention_mask.sum())
+    print(f'        [encode_prompt] LLaMA tokenized: {llama_input_ids.shape} token IDs, '
+          f'{llama_attention_length} real tokens (rest is padding)')
 
+    print(f'        [encode_prompt] Running LLaMA forward pass (this streams layers through GPU via DynamicSwap)...')
     llama_outputs = text_encoder(
         input_ids=llama_input_ids,
         attention_mask=llama_attention_mask,
@@ -49,7 +53,10 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
     # Extract 3rd-to-last hidden state, cropped to skip system-prompt tokens.
     # hidden_states[-3] is chosen because it has rich semantic content without being
     # over-specialized for LLaMA's original text-generation objective.
+    num_layers = len(llama_outputs.hidden_states)
+    print(f'        [encode_prompt] LLaMA returned {num_layers} hidden state layers, using layer [{num_layers - 3}] (3rd from last)')
     llama_vec = llama_outputs.hidden_states[-3][:, crop_start:llama_attention_length]
+    print(f'        [encode_prompt] Cropped from position {crop_start} to {llama_attention_length} -> shape {llama_vec.shape}')
 
     # CLIP -- produces a single 768-dim "pooler_output" that summarizes the entire
     # sentence's visual meaning. Used as a global conditioning signal.
@@ -63,7 +70,10 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
         return_length=False,
         return_tensors="pt",
     ).input_ids
+    print(f'        [encode_prompt] CLIP tokenized: {clip_l_input_ids.shape} (max 77 tokens)')
+    print(f'        [encode_prompt] Running CLIP-L forward pass...')
     clip_l_pooler = text_encoder_2(clip_l_input_ids.to(text_encoder_2.device), output_hidden_states=False).pooler_output
+    print(f'        [encode_prompt] CLIP pooler output: {clip_l_pooler.shape}')
 
     return llama_vec, clip_l_pooler
 
@@ -111,8 +121,11 @@ def vae_decode_fake(latents):
 # nice range for diffusion; we undo it here before decoding.
 @torch.no_grad()
 def vae_decode(latents, vae):
+    print(f'        [vae_decode] Input latent: {latents.shape}, scaling_factor={vae.config.scaling_factor:.4f}')
     latents = latents / vae.config.scaling_factor
+    print(f'        [vae_decode] Running VAE decoder network (latent -> pixels)...')
     image = vae.decode(latents.to(device=vae.device, dtype=vae.dtype)).sample
+    print(f'        [vae_decode] Output pixels: {image.shape}, value range [{image.min():.2f}, {image.max():.2f}]')
     return image
 
 
@@ -123,6 +136,12 @@ def vae_decode(latents, vae):
 # The scaling_factor normalizes latent values to a range suitable for the diffusion model.
 @torch.no_grad()
 def vae_encode(image, vae):
-    latents = vae.encode(image.to(device=vae.device, dtype=vae.dtype)).latent_dist.sample()
+    print(f'        [vae_encode] Input image: {image.shape}, device={image.device}')
+    print(f'        [vae_encode] Running VAE encoder -> produces mean + variance (distribution)...')
+    latent_dist = vae.encode(image.to(device=vae.device, dtype=vae.dtype)).latent_dist
+    print(f'        [vae_encode] Sampling one point from the latent distribution...')
+    latents = latent_dist.sample()
+    print(f'        [vae_encode] Raw latent: {latents.shape}, range [{latents.min():.2f}, {latents.max():.2f}]')
     latents = latents * vae.config.scaling_factor
+    print(f'        [vae_encode] After scaling (x{vae.config.scaling_factor:.4f}): range [{latents.min():.2f}, {latents.max():.2f}]')
     return latents
