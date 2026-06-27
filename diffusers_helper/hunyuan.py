@@ -138,10 +138,9 @@ def vae_decode(latents, vae):
 def vae_encode(image, vae):
     print(f'        [vae_encode] Input image: {image.shape}, device={image.device}')
     print(f'        [vae_encode] Running VAE encoder -> produces mean + variance (distribution)...')
-    latent_dist = vae.encode(image.to(device=vae.device, dtype=vae.dtype)).latent_dist
-    print(f'        [vae_encode] Sampling one point from the latent distribution...')
-    latents = latent_dist.sample()
-    print(f'        [vae_encode] Raw latent: {latents.shape}, range [{latents.min():.2f}, {latents.max():.2f}]')
+    latents = vae.encode(image.to(device=vae.device, dtype=vae.dtype)).latent_dist.sample()
     latents = latents * vae.config.scaling_factor
+    print(f'        [vae_encode] Sampling one point from the latent distribution...')
+    print(f'        [vae_encode] Raw latent: {latents.shape}, range [{latents.min():.2f}, {latents.max():.2f}]')
     print(f'        [vae_encode] After scaling (x{vae.config.scaling_factor:.4f}): range [{latents.min():.2f}, {latents.max():.2f}]')
     return latents

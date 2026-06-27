@@ -1,8 +1,10 @@
 """
 FramePack CLI — Generate video from an image + text prompt, no UI needed.
+Includes checkpointing: if it crashes mid-generation, re-run the same command to resume.
 
 Usage:
     python generate.py --image photo.jpg --prompt "The girl dances gracefully"
+    # If it crashes, just run the EXACT same command again — it resumes from last checkpoint.
 
 Optional flags:
     --seed 31337                   Random seed (default: 31337)
@@ -13,6 +15,7 @@ Optional flags:
     --gpu-reserve 6                GPU memory to keep free in GB, 6-128 (default: 6)
     --crf 16                       MP4 quality, 0=lossless, 51=worst (default: 16)
     --output ./outputs             Output directory (default: ./outputs)
+    --fresh                        Ignore any existing checkpoint, start from scratch
 """
 
 from diffusers_helper.hf_login import login
@@ -26,6 +29,8 @@ import numpy as np
 import argparse
 import sys
 import time
+import hashlib
+import json
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -46,16 +51,16 @@ parser = argparse.ArgumentParser(description='FramePack CLI — image-to-video g
 parser.add_argument('--image', type=str, required=True, help='Path to input image (jpg/png)')
 parser.add_argument('--prompt', type=str, required=True, help='Text prompt describing the motion')
 parser.add_argument('--seed', type=int, default=31337, help='Random seed (default: 31337)')
-parser.add_argument('--length', type=float, default=5, help='Video length in seconds, range 1-120 (default: 5)')
-parser.add_argument('--steps', type=int, default=25, help='Denoising steps, range 1-100 (default: 25)')
+parser.add_argument('--length', type=float, default=2, help='Video length in seconds, range 1-120 (default: 5)')
+parser.add_argument('--steps', type=int, default=15, help='Denoising steps, range 1-100 (default: 25)')
 parser.add_argument('--gs', type=float, default=10.0, help='Distilled guidance scale, range 1-32 (default: 10.0)')
 parser.add_argument('--teacache', action=argparse.BooleanOptionalAction, default=True, help='Use TeaCache for ~2x speed (slightly worse hands)')
-parser.add_argument('--gpu-reserve', type=float, default=6, help='GPU memory to keep free in GB, range 6-128 (default: 6)')
+parser.add_argument('--gpu-reserve', type=float, default=8, help='GPU memory to keep free in GB, range 6-128 (default: 6)')
 parser.add_argument('--crf', type=int, default=16, help='MP4 quality: 0=lossless, 23=default, 51=worst (default: 16)')
 parser.add_argument('--output', type=str, default='./outputs', help='Output directory (default: ./outputs)')
+parser.add_argument('--fresh', action='store_true', help='Ignore existing checkpoint, start from scratch')
 args = parser.parse_args()
 
-# Validate inputs
 if not os.path.isfile(args.image):
     print(f'Error: image not found: {args.image}')
     sys.exit(1)
@@ -65,6 +70,93 @@ args.steps = max(1, min(100, args.steps))
 args.gs = max(1.0, min(32.0, args.gs))
 args.gpu_reserve = max(6, min(128, args.gpu_reserve))
 args.crf = max(0, min(51, args.crf))
+
+
+# ── Checkpoint system ──────────────────────────────────────────────────────────
+# Saves intermediate tensors after each expensive step so crashes don't lose work.
+# Keyed by image name + prompt + all generation parameters.
+# Re-running the same command auto-resumes from the last saved checkpoint.
+
+CHECKPOINT_DIR = os.path.join(args.output, '.checkpoints')
+
+def _checkpoint_key():
+    """Unique key from image name + prompt + all params that affect generation."""
+    image_name = os.path.basename(args.image)
+    raw = f'{image_name}|{args.prompt}|{args.seed}|{args.length}|{args.steps}|{args.gs}|{args.teacache}'
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+def _checkpoint_path(stage):
+    """Path for a checkpoint file: .checkpoints/<key>_<stage>.pt"""
+    return os.path.join(CHECKPOINT_DIR, f'{_checkpoint_key()}_{stage}.pt')
+
+def _checkpoint_meta_path():
+    return os.path.join(CHECKPOINT_DIR, f'{_checkpoint_key()}_meta.json')
+
+def save_checkpoint(stage, data_dict):
+    """Save tensors to disk after completing an expensive step."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    path = _checkpoint_path(stage)
+    torch.save(data_dict, path)
+    # Also save/update metadata
+    meta_path = _checkpoint_meta_path()
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+    meta['image'] = os.path.basename(args.image)
+    meta['prompt'] = args.prompt
+    meta['last_stage'] = stage
+    meta['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f'        [checkpoint] Saved stage "{stage}" -> {path} ({os.path.getsize(path) / 1e6:.1f} MB)')
+
+def load_checkpoint(stage):
+    """Load a previously saved checkpoint. Returns None if not found."""
+    path = _checkpoint_path(stage)
+    if os.path.exists(path) and not args.fresh:
+        data = torch.load(path, map_location='cpu', weights_only=True)
+        print(f'        [checkpoint] RESUMED stage "{stage}" from {path}')
+        return data
+    return None
+
+def has_checkpoint(stage):
+    return os.path.exists(_checkpoint_path(stage)) and not args.fresh
+
+def clean_checkpoints():
+    """Remove all checkpoints for this job after successful completion."""
+    key = _checkpoint_key()
+    if os.path.isdir(CHECKPOINT_DIR):
+        for f in os.listdir(CHECKPOINT_DIR):
+            if f.startswith(key):
+                os.remove(os.path.join(CHECKPOINT_DIR, f))
+        print(f'        [checkpoint] Cleaned up checkpoint files for this job')
+
+
+# ── VAE decode with frame-by-frame fallback for MPS OOM ───────────────────────
+
+def vae_decode_safe(latents, vae):
+    """Decode latents to pixels. Falls back to frame-by-frame if OOM."""
+    try:
+        return vae_decode(latents, vae)
+    except RuntimeError as e:
+        if 'out of memory' in str(e).lower() or 'MPS' in str(e):
+            num_frames = latents.shape[2]
+            print(f'        [vae_decode_safe] OOM decoding {num_frames} frames at once!')
+            print(f'        [vae_decode_safe] Falling back to frame-by-frame decode...')
+            frames = []
+            for i in range(num_frames):
+                print(f'        [vae_decode_safe] Decoding frame {i + 1}/{num_frames}...')
+                frame_latent = latents[:, :, i:i+1, :, :]
+                frame_pixels = vae_decode(frame_latent, vae)
+                frames.append(frame_pixels.cpu())
+            result = torch.cat(frames, dim=2)
+            print(f'        [vae_decode_safe] All frames decoded. Shape: {result.shape}')
+            return result
+        raise
+
+
+# ── Print banner ───────────────────────────────────────────────────────────────
 
 print('=' * 70)
 print('FRAMEPACK CLI — Image-to-Video Generation')
@@ -80,6 +172,9 @@ print(f'  GPU reserve:   {args.gpu_reserve} GB')
 print(f'  CRF:           {args.crf}')
 print(f'  Output dir:    {args.output}')
 print(f'  Device:        {gpu}')
+print(f'  Checkpoint key:{_checkpoint_key()}')
+if has_checkpoint('encodings'):
+    print(f'  RESUMABLE:     Yes! Found checkpoint for this image+prompt+params')
 print('=' * 70)
 
 
@@ -176,110 +271,144 @@ def generate():
     print('\n  Clearing GPU — moving all models to CPU...')
     unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
 
-    # ── Step 1: Text encoding ──────────────────────────────────────────────
-    print('\n>>> STEP 1/5: TEXT ENCODING')
-    print('-' * 70)
-    print(f'  Prompt: "{args.prompt}"')
-    t1 = time.time()
+    # ── Steps 1-3: Encoding (checkpointed as one unit) ─────────────────────
+    cached = load_checkpoint('encodings')
 
-    print('  [1.1] Moving one LLaMA parameter to GPU (tricks diffusers into thinking model is on GPU)...')
-    fake_diffusers_current_device(text_encoder, gpu)
+    if cached is not None:
+        print('\n>>> STEPS 1-3: SKIPPED (loaded from checkpoint)')
+        print('-' * 70)
+        llama_vec = cached['llama_vec']
+        llama_vec_n = cached['llama_vec_n']
+        clip_l_pooler = cached['clip_l_pooler']
+        clip_l_pooler_n = cached['clip_l_pooler_n']
+        llama_attention_mask = cached['llama_attention_mask']
+        llama_attention_mask_n = cached['llama_attention_mask_n']
+        start_latent = cached['start_latent']
+        image_encoder_last_hidden_state = cached['image_encoder_last_hidden_state']
+        height = int(cached['height'])
+        width = int(cached['width'])
+        print(f'  Restored: llama_vec={llama_vec.shape}, start_latent={start_latent.shape}, '
+              f'clip_vision={image_encoder_last_hidden_state.shape}')
+        print(f'  Resolution: {width}x{height}')
+    else:
+        # ── Step 1: Text encoding ──────────────────────────────────────────
+        print('\n>>> STEP 1/5: TEXT ENCODING')
+        print('-' * 70)
+        print(f'  Prompt: "{args.prompt}"')
+        t1 = time.time()
 
-    print('  [1.2] Loading CLIP-L text encoder to GPU...')
-    load_model_as_complete(text_encoder_2, target_device=gpu)
+        print('  [1.1] Moving one LLaMA parameter to GPU (tricks diffusers into thinking model is on GPU)...')
+        fake_diffusers_current_device(text_encoder, gpu)
 
-    print('  [1.3] Setting output_hidden_states=True on LLaMA config...')
-    text_encoder.config.output_hidden_states = True
+        print('  [1.2] Loading CLIP-L text encoder to GPU...')
+        load_model_as_complete(text_encoder_2, target_device=gpu)
 
-    print('  [1.4] Running dual text encoding...')
-    print('        LLaMA: tokenize -> run through 32 transformer layers -> extract layer[-3] features')
-    print('        CLIP:  tokenize -> encode -> extract pooler output (single summary vector)')
-    llama_vec, clip_l_pooler = encode_prompt_conds(args.prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-    print(f'        LLaMA output shape: {llama_vec.shape}  (1 batch, {llama_vec.shape[1]} tokens, {llama_vec.shape[2]} dims)')
-    print(f'        CLIP pooler shape:  {clip_l_pooler.shape}  (1 batch, {clip_l_pooler.shape[1]} dims)')
+        print('  [1.3] Setting output_hidden_states=True on LLaMA config...')
+        text_encoder.config.output_hidden_states = True
 
-    print('  [1.5] Creating empty negative embeddings (CFG=1, no negative prompt needed)...')
-    llama_vec_n = torch.zeros_like(llama_vec)
-    clip_l_pooler_n = torch.zeros_like(clip_l_pooler)
+        print('  [1.4] Running dual text encoding...')
+        print('        LLaMA: tokenize -> run through 32 transformer layers -> extract layer[-3] features')
+        print('        CLIP:  tokenize -> encode -> extract pooler output (single summary vector)')
+        llama_vec, clip_l_pooler = encode_prompt_conds(args.prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        print(f'        LLaMA output shape: {llama_vec.shape}  (1 batch, {llama_vec.shape[1]} tokens, {llama_vec.shape[2]} dims)')
+        print(f'        CLIP pooler shape:  {clip_l_pooler.shape}  (1 batch, {clip_l_pooler.shape[1]} dims)')
 
-    print('  [1.6] Padding/cropping text embeddings to fixed length of 512 tokens...')
-    llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-    llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
-    real_tokens = int(llama_attention_mask.sum())
-    print(f'        After padding: {llama_vec.shape} — {real_tokens} real tokens, {512 - real_tokens} padding tokens')
-    print(f'        Attention mask: {llama_attention_mask.shape} (True=real, False=padding)')
+        print('  [1.5] Creating empty negative embeddings (CFG=1, no negative prompt needed)...')
+        llama_vec_n = torch.zeros_like(llama_vec)
+        clip_l_pooler_n = torch.zeros_like(clip_l_pooler)
 
-    print(f'  Text encoding done in {time.time() - t1:.1f}s')
+        print('  [1.6] Padding/cropping text embeddings to fixed length of 512 tokens...')
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+        real_tokens = int(llama_attention_mask.sum())
+        print(f'        After padding: {llama_vec.shape} — {real_tokens} real tokens, {512 - real_tokens} padding tokens')
+        print(f'        Attention mask: {llama_attention_mask.shape} (True=real, False=padding)')
 
-    # ── Step 2: Image processing ───────────────────────────────────────────
-    print('\n>>> STEP 2/5: IMAGE PROCESSING')
-    print('-' * 70)
-    t2 = time.time()
+        print(f'  Text encoding done in {time.time() - t1:.1f}s')
 
-    print(f'  [2.1] Loading image: {args.image}')
-    input_image = np.array(Image.open(args.image).convert('RGB'))
-    H, W, C = input_image.shape
-    print(f'        Original size: {W}x{H} (width x height), {C} channels, dtype={input_image.dtype}')
+        # ── Step 2: Image processing ───────────────────────────────────────
+        print('\n>>> STEP 2/5: IMAGE PROCESSING')
+        print('-' * 70)
+        t2 = time.time()
 
-    print('  [2.2] Finding nearest resolution bucket (model was trained on specific sizes)...')
-    height, width = find_nearest_bucket(H, W, resolution=640)
-    print(f'        Selected bucket: {width}x{height} (best aspect ratio match from ~640p buckets)')
+        print(f'  [2.1] Loading image: {args.image}')
+        input_image = np.array(Image.open(args.image).convert('RGB'))
+        H, W, C = input_image.shape
+        print(f'        Original size: {W}x{H} (width x height), {C} channels, dtype={input_image.dtype}')
 
-    print('  [2.3] Resize + center crop to exact bucket dimensions...')
-    input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
-    print(f'        Result: {input_image_np.shape[1]}x{input_image_np.shape[0]}')
+        print('  [2.2] Finding nearest resolution bucket (model was trained on specific sizes)...')
+        height, width = find_nearest_bucket(H, W, resolution=640)
+        print(f'        Selected bucket: {width}x{height} (best aspect ratio match from ~640p buckets)')
 
-    ref_path = os.path.join(args.output, f'{job_id}.png')
-    Image.fromarray(input_image_np).save(ref_path)
-    print(f'        Saved reference image: {ref_path}')
+        print('  [2.3] Resize + center crop to exact bucket dimensions...')
+        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+        print(f'        Result: {input_image_np.shape[1]}x{input_image_np.shape[0]}')
 
-    print('  [2.4] Converting image to pytorch tensor...')
-    print(f'        Pixel range [0, 255] -> normalize to [-1, 1]')
-    input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
-    print(f'        Shape before permute: {input_image_pt.shape} (H, W, C)')
-    input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
-    print(f'        Shape after permute:  {input_image_pt.shape} (Batch=1, C=3, T=1, H={height}, W={width})')
+        ref_path = os.path.join(args.output, f'{job_id}.png')
+        Image.fromarray(input_image_np).save(ref_path)
+        print(f'        Saved reference image: {ref_path}')
 
-    print(f'  Image processing done in {time.time() - t2:.1f}s')
+        print('  [2.4] Converting image to pytorch tensor...')
+        print(f'        Pixel range [0, 255] -> normalize to [-1, 1]')
+        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
+        print(f'        Shape before permute: {input_image_pt.shape} (H, W, C)')
+        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+        print(f'        Shape after permute:  {input_image_pt.shape} (Batch=1, C=3, T=1, H={height}, W={width})')
 
-    # ── Step 3: VAE + CLIP Vision encoding ─────────────────────────────────
-    print('\n>>> STEP 3/5: ENCODING IMAGE TO LATENT SPACE')
-    print('-' * 70)
-    t3 = time.time()
+        print(f'  Image processing done in {time.time() - t2:.1f}s')
 
-    print('  [3.1] Loading VAE to GPU...')
-    load_model_as_complete(vae, target_device=gpu)
+        # ── Step 3: VAE + CLIP Vision encoding ─────────────────────────────
+        print('\n>>> STEP 3/5: ENCODING IMAGE TO LATENT SPACE')
+        print('-' * 70)
+        t3 = time.time()
 
-    print('  [3.2] VAE encoding: compressing image pixels -> latent representation...')
-    print(f'        Input:  {input_image_pt.shape}  (pixels: 3 channels, {height}x{width})')
-    start_latent = vae_encode(input_image_pt, vae)
-    print(f'        Output: {start_latent.shape}  (latent: {start_latent.shape[1]} channels, '
-          f'{start_latent.shape[3]}x{start_latent.shape[4]})')
-    print(f'        Compression: {height}x{width} -> {start_latent.shape[3]}x{start_latent.shape[4]} '
-          f'(8x spatial downscale)')
-    print(f'        Channels: 3 RGB -> {start_latent.shape[1]} latent channels')
+        print('  [3.1] Loading VAE to GPU...')
+        load_model_as_complete(vae, target_device=gpu)
 
-    print('  [3.3] Loading SigLIP image encoder to GPU (unloads VAE first)...')
-    load_model_as_complete(image_encoder, target_device=gpu)
+        print('  [3.2] VAE encoding: compressing image pixels -> latent representation...')
+        print(f'        Input:  {input_image_pt.shape}  (pixels: 3 channels, {height}x{width})')
+        start_latent = vae_encode(input_image_pt, vae)
+        print(f'        Output: {start_latent.shape}  (latent: {start_latent.shape[1]} channels, '
+              f'{start_latent.shape[3]}x{start_latent.shape[4]})')
+        print(f'        Compression: {height}x{width} -> {start_latent.shape[3]}x{start_latent.shape[4]} '
+              f'(8x spatial downscale)')
+        print(f'        Channels: 3 RGB -> {start_latent.shape[1]} latent channels')
 
-    print('  [3.4] CLIP Vision encoding: understanding image content...')
-    print(f'        Input: {input_image_np.shape} numpy array (uint8)')
-    print(f'        The image is split into 14x14 pixel patches -> each patch becomes a vector')
-    image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-    image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-    print(f'        Output: {image_encoder_last_hidden_state.shape}  '
-          f'({image_encoder_last_hidden_state.shape[1]} patches, '
-          f'{image_encoder_last_hidden_state.shape[2]} dims each)')
+        print('  [3.3] Loading SigLIP image encoder to GPU (unloads VAE first)...')
+        load_model_as_complete(image_encoder, target_device=gpu)
 
-    print('  [3.5] Casting all embeddings to transformer dtype (bfloat16)...')
-    llama_vec = llama_vec.to(transformer.dtype)
-    llama_vec_n = llama_vec_n.to(transformer.dtype)
-    clip_l_pooler = clip_l_pooler.to(transformer.dtype)
-    clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
-    image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
-    print(f'        All embeddings now in {transformer.dtype}')
+        print('  [3.4] CLIP Vision encoding: understanding image content...')
+        print(f'        Input: {input_image_np.shape} numpy array (uint8)')
+        print(f'        The image is split into 14x14 pixel patches -> each patch becomes a vector')
+        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        print(f'        Output: {image_encoder_last_hidden_state.shape}  '
+              f'({image_encoder_last_hidden_state.shape[1]} patches, '
+              f'{image_encoder_last_hidden_state.shape[2]} dims each)')
 
-    print(f'  Encoding done in {time.time() - t3:.1f}s')
+        print('  [3.5] Casting all embeddings to transformer dtype (bfloat16)...')
+        llama_vec = llama_vec.to(transformer.dtype)
+        llama_vec_n = llama_vec_n.to(transformer.dtype)
+        clip_l_pooler = clip_l_pooler.to(transformer.dtype)
+        clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+        print(f'        All embeddings now in {transformer.dtype}')
+
+        print(f'  Encoding done in {time.time() - t3:.1f}s')
+
+        # Save checkpoint — this is the most expensive part to redo
+        save_checkpoint('encodings', {
+            'llama_vec': llama_vec.cpu(),
+            'llama_vec_n': llama_vec_n.cpu(),
+            'clip_l_pooler': clip_l_pooler.cpu(),
+            'clip_l_pooler_n': clip_l_pooler_n.cpu(),
+            'llama_attention_mask': llama_attention_mask.cpu(),
+            'llama_attention_mask_n': llama_attention_mask_n.cpu(),
+            'start_latent': start_latent.cpu(),
+            'image_encoder_last_hidden_state': image_encoder_last_hidden_state.cpu(),
+            'height': torch.tensor(height),
+            'width': torch.tensor(width),
+        })
 
     # ── Step 4: Diffusion sampling ─────────────────────────────────────────
     print('\n>>> STEP 4/5: DIFFUSION SAMPLING (this is the slow part)')
@@ -304,6 +433,29 @@ def generate():
         latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
     print(f'        Padding sequence: {latent_paddings}')
     print(f'        (Higher padding = further from start of video, generated first)')
+
+    # Check which sections are already done
+    start_section = 0
+    for si in range(len(latent_paddings)):
+        section_ckpt = load_checkpoint(f'section_{si}')
+        if section_ckpt is not None:
+            history_latents = section_ckpt['history_latents']
+            total_generated_latent_frames = int(section_ckpt['total_generated_latent_frames'])
+            if 'history_pixels' in section_ckpt and section_ckpt['history_pixels'] is not None:
+                history_pixels = section_ckpt['history_pixels']
+            # Advance the RNG to the same state by generating the same random numbers
+            for _ in range(si + 1):
+                torch.randn((1, 16, (num_frames + 3) // 4, height // 8, width // 8), generator=rnd)
+            start_section = si + 1
+            print(f'  Restored section {si + 1}/{len(latent_paddings)} from checkpoint')
+            print(f'  history_latents: {history_latents.shape}, total_frames: {total_generated_latent_frames}')
+        else:
+            break
+
+    if start_section > 0:
+        print(f'  Resuming from section {start_section + 1}/{len(latent_paddings)}')
+    else:
+        print(f'  Starting from scratch, {len(latent_paddings)} sections')
 
     output_filename = None
 
@@ -426,7 +578,7 @@ def generate():
 
         if history_pixels is None:
             print(f'        First section — decoding all latent frames at once')
-            history_pixels = vae_decode(real_history_latents, vae).cpu()
+            history_pixels = vae_decode_safe(real_history_latents, vae).cpu()
             print(f'        Decoded pixel shape: {history_pixels.shape}')
             print(f'        Pixel frames: {history_pixels.shape[2]}, Resolution: {history_pixels.shape[3]}x{history_pixels.shape[4]}')
         else:
@@ -434,7 +586,7 @@ def generate():
             overlapped_frames = LATENT_WINDOW_SIZE * 4 - 3
             print(f'        Decoding section: {section_latent_frames} latent frames')
             print(f'        Overlap with previous: {overlapped_frames} pixel frames (for smooth blending)')
-            current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+            current_pixels = vae_decode_safe(real_history_latents[:, :, :section_latent_frames], vae).cpu()
             print(f'        Decoded section pixels: {current_pixels.shape}')
             print(f'        Blending with history using soft_append (linear interpolation in overlap zone)...')
             history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
@@ -452,10 +604,18 @@ def generate():
         print(f'        {total_frames} frames, {total_frames/30:.1f}s video')
         print(f'  Decode + save took {time.time() - t5:.1f}s')
 
+        # Checkpoint this section (save latents + pixels for resume)
+        save_checkpoint(f'section_{section_idx}', {
+            'history_latents': history_latents.cpu(),
+            'total_generated_latent_frames': torch.tensor(total_generated_latent_frames),
+            'history_pixels': history_pixels.cpu() if history_pixels is not None else None,
+        })
+
         if is_last_section:
             print(f'\n  Last section complete — video generation finished!')
             break
 
+    # Clean up checkpoints on success
     total_time = time.time() - gen_start
     print('\n' + '=' * 70)
     print(f'DONE! Total generation time: {total_time:.1f}s ({total_time/60:.1f} min)')
@@ -464,6 +624,8 @@ def generate():
     print(f'Video: {total_frames} frames, {total_frames/30:.1f}s at 30fps')
     print(f'Speed: {total_time/max(total_frames,1):.2f}s per frame')
     print('=' * 70)
+
+    clean_checkpoints()
     return output_filename
 
 
