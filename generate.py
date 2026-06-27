@@ -135,25 +135,46 @@ def clean_checkpoints():
 
 # ── VAE decode with frame-by-frame fallback for MPS OOM ───────────────────────
 
-def vae_decode_safe(latents, vae):
-    """Decode latents to pixels. Falls back to frame-by-frame if OOM."""
+def vae_decode_safe(latents, vae, unload_fn=None):
+    """Decode latents to pixels. Falls back to frame-by-frame if OOM.
+    unload_fn: optional callable to free extra GPU memory before retry (e.g. move transformer to CPU)
+    """
     try:
         return vae_decode(latents, vae)
     except RuntimeError as e:
-        if 'out of memory' in str(e).lower() or 'MPS' in str(e):
-            num_frames = latents.shape[2]
-            print(f'        [vae_decode_safe] OOM decoding {num_frames} frames at once!')
-            print(f'        [vae_decode_safe] Falling back to frame-by-frame decode...')
-            frames = []
-            for i in range(num_frames):
-                print(f'        [vae_decode_safe] Decoding frame {i + 1}/{num_frames}...')
-                frame_latent = latents[:, :, i:i+1, :, :]
-                frame_pixels = vae_decode(frame_latent, vae)
-                frames.append(frame_pixels.cpu())
-            result = torch.cat(frames, dim=2)
-            print(f'        [vae_decode_safe] All frames decoded. Shape: {result.shape}')
-            return result
-        raise
+        if 'out of memory' not in str(e).lower() and 'MPS' not in str(e):
+            raise
+        num_frames = latents.shape[2]
+        print(f'        [vae_decode_safe] OOM decoding {num_frames} frames at once!')
+
+        # Free as much GPU memory as possible before retrying
+        if unload_fn is not None:
+            print(f'        [vae_decode_safe] Unloading other models to free GPU memory...')
+            unload_fn()
+
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+
+        print(f'        [vae_decode_safe] Falling back to frame-by-frame decode...')
+        # Move latents to CPU to free GPU memory, decode one frame at a time
+        latents_cpu = latents.cpu()
+        frames = []
+        for i in range(num_frames):
+            print(f'        [vae_decode_safe] Decoding frame {i + 1}/{num_frames}...')
+            frame_latent = latents_cpu[:, :, i:i+1, :, :]
+            frame_pixels = vae_decode(frame_latent, vae)
+            frames.append(frame_pixels.cpu())
+            # Free GPU memory after each frame
+            del frame_pixels
+            if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+                torch.mps.empty_cache()
+        result = torch.cat(frames, dim=2)
+        print(f'        [vae_decode_safe] All frames decoded. Shape: {result.shape}')
+        return result
 
 
 # ── Print banner ───────────────────────────────────────────────────────────────
@@ -434,151 +455,205 @@ def generate():
     print(f'        Padding sequence: {latent_paddings}')
     print(f'        (Higher padding = further from start of video, generated first)')
 
-    # Check which sections are already done
+    # Check which sections are already done (fully done or sampling-only)
     start_section = 0
+    resume_from_sampled = False  # True = sampling done but VAE decode crashed
     for si in range(len(latent_paddings)):
+        # First check if the section is FULLY done (sampling + decode + save)
         section_ckpt = load_checkpoint(f'section_{si}')
         if section_ckpt is not None:
             history_latents = section_ckpt['history_latents']
             total_generated_latent_frames = int(section_ckpt['total_generated_latent_frames'])
             if 'history_pixels' in section_ckpt and section_ckpt['history_pixels'] is not None:
                 history_pixels = section_ckpt['history_pixels']
-            # Advance the RNG to the same state by generating the same random numbers
+            # Advance the RNG to the same state
             for _ in range(si + 1):
                 torch.randn((1, 16, (num_frames + 3) // 4, height // 8, width // 8), generator=rnd)
             start_section = si + 1
-            print(f'  Restored section {si + 1}/{len(latent_paddings)} from checkpoint')
-            print(f'  history_latents: {history_latents.shape}, total_frames: {total_generated_latent_frames}')
-        else:
-            break
+            print(f'  [checkpoint] Restored COMPLETED section {si + 1}/{len(latent_paddings)}')
+            print(f'        history_latents: {history_latents.shape}, total_frames: {total_generated_latent_frames}')
+            continue
 
-    if start_section > 0:
-        print(f'  Resuming from section {start_section + 1}/{len(latent_paddings)}')
+        # Check if sampling was done but VAE decode crashed
+        sampled_ckpt = load_checkpoint(f'section_{si}_sampled')
+        if sampled_ckpt is not None:
+            history_latents = sampled_ckpt['history_latents']
+            total_generated_latent_frames = int(sampled_ckpt['total_generated_latent_frames'])
+            # Advance the RNG past this section too (sampling consumed the RNG)
+            for _ in range(si + 1):
+                torch.randn((1, 16, (num_frames + 3) // 4, height // 8, width // 8), generator=rnd)
+            start_section = si  # Re-run THIS section, but skip sampling
+            resume_from_sampled = True
+            print(f'  [checkpoint] Restored SAMPLED (not decoded) section {si + 1}/{len(latent_paddings)}')
+            print(f'        Sampling was done but VAE decode crashed — will retry decode only')
+            print(f'        history_latents: {history_latents.shape}, total_frames: {total_generated_latent_frames}')
+        break
+
+    if start_section > 0 or resume_from_sampled:
+        if resume_from_sampled:
+            print(f'  Resuming section {start_section + 1}/{len(latent_paddings)} (decode only, sampling saved)')
+        else:
+            print(f'  Resuming from section {start_section + 1}/{len(latent_paddings)}')
     else:
         print(f'  Starting from scratch, {len(latent_paddings)} sections')
 
     output_filename = None
 
-    for section_idx, latent_padding in enumerate(latent_paddings):
+    for section_idx in range(start_section, len(latent_paddings)):
+        latent_padding = latent_paddings[section_idx]
         is_last_section = latent_padding == 0
         latent_padding_size = latent_padding * LATENT_WINDOW_SIZE
         section_start = time.time()
 
-        print(f'\n  ---- Section {section_idx + 1}/{total_latent_sections} ----')
+        # If resuming from a sampled checkpoint, skip straight to VAE decode
+        skip_sampling = resume_from_sampled and section_idx == start_section
+        if skip_sampling:
+            is_last_section = bool(load_checkpoint(f'section_{section_idx}_sampled')['is_last_section'])
+            print(f'\n  ---- Section {section_idx + 1}/{len(latent_paddings)} (RESUME: skip to VAE decode) ----')
+        else:
+            print(f'\n  ---- Section {section_idx + 1}/{total_latent_sections} ----')
         print(f'  Padding: {latent_padding} x {LATENT_WINDOW_SIZE} = {latent_padding_size} blank frames')
         print(f'  Is last section (start of video): {is_last_section}')
 
-        print(f'  [4.4.{section_idx}] Building position indices for Frame Packing...')
-        total_index_length = 1 + latent_padding_size + LATENT_WINDOW_SIZE + 1 + 2 + 16
-        print(f'        Total index length: {total_index_length} = '
-              f'1(start) + {latent_padding_size}(padding) + {LATENT_WINDOW_SIZE}(noisy) + '
-              f'1(recent_1x) + 2(recent_2x) + 16(old_4x)')
-        indices = torch.arange(0, total_index_length).unsqueeze(0)
-        clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, LATENT_WINDOW_SIZE, 1, 2, 16], dim=1)
-        clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-        print(f'        Noisy latent indices: {latent_indices[0].tolist()[:5]}... (the frames being generated)')
-        print(f'        Clean 1x indices:     {clean_latent_indices[0].tolist()} (full-res context)')
-        print(f'        Clean 2x indices:     {clean_latent_2x_indices[0].tolist()} (2x compressed)')
-        print(f'        Clean 4x indices:     {clean_latent_4x_indices[0].tolist()[:5]}... (4x compressed, 16 frames)')
+        if not skip_sampling:
+            print(f'  [4.4.{section_idx}] Building position indices for Frame Packing...')
+            total_index_length = 1 + latent_padding_size + LATENT_WINDOW_SIZE + 1 + 2 + 16
+            print(f'        Total index length: {total_index_length} = '
+                  f'1(start) + {latent_padding_size}(padding) + {LATENT_WINDOW_SIZE}(noisy) + '
+                  f'1(recent_1x) + 2(recent_2x) + 16(old_4x)')
+            indices = torch.arange(0, total_index_length).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, LATENT_WINDOW_SIZE, 1, 2, 16], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+            print(f'        Noisy latent indices: {latent_indices[0].tolist()[:5]}... (the frames being generated)')
+            print(f'        Clean 1x indices:     {clean_latent_indices[0].tolist()} (full-res context)')
+            print(f'        Clean 2x indices:     {clean_latent_2x_indices[0].tolist()} (2x compressed)')
+            print(f'        Clean 4x indices:     {clean_latent_4x_indices[0].tolist()[:5]}... (4x compressed, 16 frames)')
 
-        print(f'  [4.5.{section_idx}] Preparing clean latent context (Frame Packing)...')
-        clean_latents_pre = start_latent.to(history_latents)
-        clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-        clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
-        print(f'        clean_latents (1x): {clean_latents.shape}  — start frame + most recent frame')
-        print(f'        clean_latents_2x:   {clean_latents_2x.shape}  — 2x compressed recent history')
-        print(f'        clean_latents_4x:   {clean_latents_4x.shape}  — 4x compressed full history')
+            print(f'  [4.5.{section_idx}] Preparing clean latent context (Frame Packing)...')
+            clean_latents_pre = start_latent.to(history_latents)
+            clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+            print(f'        clean_latents (1x): {clean_latents.shape}  — start frame + most recent frame')
+            print(f'        clean_latents_2x:   {clean_latents_2x.shape}  — 2x compressed recent history')
+            print(f'        clean_latents_4x:   {clean_latents_4x.shape}  — 4x compressed full history')
 
-        print(f'  [4.6.{section_idx}] Moving transformer to GPU (partial load, respecting {args.gpu_reserve}GB reserve)...')
-        unload_complete_models()
-        move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=args.gpu_reserve)
+            print(f'  [4.6.{section_idx}] Moving transformer to GPU (partial load, respecting {args.gpu_reserve}GB reserve)...')
+            unload_complete_models()
+            move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=args.gpu_reserve)
 
-        print(f'  [4.7.{section_idx}] Initializing TeaCache: enabled={args.teacache}')
-        if args.teacache:
-            print(f'        TeaCache will skip transformer blocks when input change < threshold')
-            print(f'        This gives ~2x speedup but may produce slightly worse hands/fingers')
-        transformer.initialize_teacache(enable_teacache=args.teacache, num_steps=args.steps)
+            print(f'  [4.7.{section_idx}] Initializing TeaCache: enabled={args.teacache}')
+            if args.teacache:
+                print(f'        TeaCache will skip transformer blocks when input change < threshold')
+                print(f'        This gives ~2x speedup but may produce slightly worse hands/fingers')
+            transformer.initialize_teacache(enable_teacache=args.teacache, num_steps=args.steps)
 
-        print(f'  [4.8.{section_idx}] Starting {args.steps}-step denoising with UniPC sampler...')
-        print(f'        UniPC: Unified Predictor-Corrector ODE solver (order 3)')
-        print(f'        Each step: transformer forward pass -> predict clean video -> update latent')
-        step_times = []
+            print(f'  [4.8.{section_idx}] Starting {args.steps}-step denoising with UniPC sampler...')
+            print(f'        UniPC: Unified Predictor-Corrector ODE solver (order 3)')
+            print(f'        Each step: transformer forward pass -> predict clean video -> update latent')
 
-        def callback(d):
-            current_step = d['i'] + 1
-            total_frames = int(max(0, total_generated_latent_frames * 4 - 3))
-            video_len = max(0, total_frames / 30)
+            def callback(d):
+                current_step = d['i'] + 1
+                total_frames = int(max(0, total_generated_latent_frames * 4 - 3))
+                video_len = max(0, total_frames / 30)
 
-            elapsed = time.time() - section_start
-            avg_per_step = elapsed / current_step if current_step > 0 else 0
-            remaining = avg_per_step * (args.steps - current_step)
+                elapsed = time.time() - section_start
+                avg_per_step = elapsed / current_step if current_step > 0 else 0
+                remaining = avg_per_step * (args.steps - current_step)
 
-            print(f'        Step {current_step:3d}/{args.steps} | '
-                  f'~{avg_per_step:.1f}s/step | '
-                  f'ETA {remaining:.0f}s | '
-                  f'{total_frames} total frames | '
-                  f'{video_len:.1f}s video')
+                print(f'        Step {current_step:3d}/{args.steps} | '
+                      f'~{avg_per_step:.1f}s/step | '
+                      f'ETA {remaining:.0f}s | '
+                      f'{total_frames} total frames | '
+                      f'{video_len:.1f}s video')
 
-        generated_latents = sample_hunyuan(
-            transformer=transformer,
-            width=width,
-            height=height,
-            frames=num_frames,
-            real_guidance_scale=1.0,
-            distilled_guidance_scale=args.gs,
-            guidance_rescale=0.0,
-            num_inference_steps=args.steps,
-            generator=rnd,
-            prompt_embeds=llama_vec,
-            prompt_embeds_mask=llama_attention_mask,
-            prompt_poolers=clip_l_pooler,
-            negative_prompt_embeds=llama_vec_n,
-            negative_prompt_embeds_mask=llama_attention_mask_n,
-            negative_prompt_poolers=clip_l_pooler_n,
-            device=gpu,
-            dtype=torch.bfloat16,
-            image_embeddings=image_encoder_last_hidden_state,
-            latent_indices=latent_indices,
-            clean_latents=clean_latents,
-            clean_latent_indices=clean_latent_indices,
-            clean_latents_2x=clean_latents_2x,
-            clean_latent_2x_indices=clean_latent_2x_indices,
-            clean_latents_4x=clean_latents_4x,
-            clean_latent_4x_indices=clean_latent_4x_indices,
-            callback=callback,
-        )
+            generated_latents = sample_hunyuan(
+                transformer=transformer,
+                sampler='unipc',
+                width=width,
+                height=height,
+                frames=num_frames,
+                real_guidance_scale=1.0,
+                distilled_guidance_scale=args.gs,
+                guidance_rescale=0.0,
+                num_inference_steps=args.steps,
+                generator=rnd,
+                prompt_embeds=llama_vec,
+                prompt_embeds_mask=llama_attention_mask,
+                prompt_poolers=clip_l_pooler,
+                negative_prompt_embeds=llama_vec_n,
+                negative_prompt_embeds_mask=llama_attention_mask_n,
+                negative_prompt_poolers=clip_l_pooler_n,
+                device=gpu,
+                dtype=torch.bfloat16,
+                image_embeddings=image_encoder_last_hidden_state,
+                latent_indices=latent_indices,
+                clean_latents=clean_latents,
+                clean_latent_indices=clean_latent_indices,
+                clean_latents_2x=clean_latents_2x,
+                clean_latent_2x_indices=clean_latent_2x_indices,
+                clean_latents_4x=clean_latents_4x,
+                clean_latent_4x_indices=clean_latent_4x_indices,
+                callback=callback,
+            )
 
-        print(f'        Sampling done. Generated latent shape: {generated_latents.shape}')
-        print(f'        Section took {time.time() - section_start:.1f}s')
+            print(f'        Sampling done. Generated latent shape: {generated_latents.shape}')
+            print(f'        Section took {time.time() - section_start:.1f}s')
 
-        if is_last_section:
-            print(f'  [4.9.{section_idx}] Last section — prepending start frame to generated latents')
-            generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
-            print(f'        After prepend: {generated_latents.shape}')
+            if is_last_section:
+                print(f'  [4.9.{section_idx}] Last section — prepending start frame to generated latents')
+                generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
+                print(f'        After prepend: {generated_latents.shape}')
 
-        total_generated_latent_frames += int(generated_latents.shape[2])
-        print(f'  Total generated latent frames so far: {total_generated_latent_frames}')
+            total_generated_latent_frames += int(generated_latents.shape[2])
+            print(f'  Total generated latent frames so far: {total_generated_latent_frames}')
 
-        print(f'  [4.10.{section_idx}] Prepending to history (inverted order: new frames go to front)...')
-        history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
-        print(f'        history_latents shape: {history_latents.shape}')
+            print(f'  [4.10.{section_idx}] Prepending to history (inverted order: new frames go to front)...')
+            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+            print(f'        history_latents shape: {history_latents.shape}')
+
+            # Checkpoint AFTER sampling, BEFORE VAE decode — saves 30+ min of diffusion work
+            save_checkpoint(f'section_{section_idx}_sampled', {
+                'history_latents': history_latents.cpu(),
+                'total_generated_latent_frames': torch.tensor(total_generated_latent_frames),
+                'is_last_section': torch.tensor(is_last_section),
+            })
+        else:
+            print(f'  Sampling SKIPPED (loaded from checkpoint)')
 
         # ── Step 5: VAE decode this section ────────────────────────────────
         print(f'\n>>> STEP 5/5: VAE DECODING (section {section_idx + 1})')
         print('-' * 70)
         t5 = time.time()
 
-        print(f'  [5.1] Offloading transformer, loading VAE to GPU...')
-        offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+        print(f'  [5.1] Fully unloading transformer to CPU, then loading VAE to GPU...')
+        # Fully move transformer to CPU (not partial offload) to maximize VAE memory
+        transformer.to(device='cpu')
+        unload_complete_models()
+        import gc; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
         load_model_as_complete(vae, target_device=gpu)
 
         real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
         print(f'  [5.2] Decoding latents -> pixels...')
         print(f'        Latent shape to decode: {real_history_latents.shape}')
 
+        # Helper to fully nuke GPU memory if frame-by-frame decode also OOMs
+        def _emergency_unload():
+            transformer.to(device='cpu')
+            unload_complete_models()
+            import gc; gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+                torch.mps.empty_cache()
+            load_model_as_complete(vae, target_device=gpu)
+
         if history_pixels is None:
             print(f'        First section — decoding all latent frames at once')
-            history_pixels = vae_decode_safe(real_history_latents, vae).cpu()
+            history_pixels = vae_decode_safe(real_history_latents, vae, unload_fn=_emergency_unload).cpu()
             print(f'        Decoded pixel shape: {history_pixels.shape}')
             print(f'        Pixel frames: {history_pixels.shape[2]}, Resolution: {history_pixels.shape[3]}x{history_pixels.shape[4]}')
         else:
@@ -586,7 +661,7 @@ def generate():
             overlapped_frames = LATENT_WINDOW_SIZE * 4 - 3
             print(f'        Decoding section: {section_latent_frames} latent frames')
             print(f'        Overlap with previous: {overlapped_frames} pixel frames (for smooth blending)')
-            current_pixels = vae_decode_safe(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+            current_pixels = vae_decode_safe(real_history_latents[:, :, :section_latent_frames], vae, unload_fn=_emergency_unload).cpu()
             print(f'        Decoded section pixels: {current_pixels.shape}')
             print(f'        Blending with history using soft_append (linear interpolation in overlap zone)...')
             history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
