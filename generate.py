@@ -568,7 +568,6 @@ def generate():
 
             generated_latents = sample_hunyuan(
                 transformer=transformer,
-                sampler='unipc',
                 width=width,
                 height=height,
                 frames=num_frames,
@@ -651,14 +650,24 @@ def generate():
                 torch.mps.empty_cache()
             load_model_as_complete(vae, target_device=gpu)
 
-        if history_pixels is None:
-            print(f'        First section — decoding all latent frames at once')
+        section_latent_frames = (LATENT_WINDOW_SIZE * 2 + 1) if is_last_section else (LATENT_WINDOW_SIZE * 2)
+        overlapped_frames = LATENT_WINDOW_SIZE * 4 - 3
+
+        # Decide whether to blend or full-decode:
+        # - No pixel history yet → full decode
+        # - Pixel history too short for overlap (e.g. after checkpoint resume) → full decode
+        # - Normal case → decode only the new section and blend with existing pixels
+        can_blend = (history_pixels is not None and history_pixels.shape[2] >= overlapped_frames)
+
+        if not can_blend:
+            if history_pixels is not None:
+                print(f'        History pixels ({history_pixels.shape[2]} frames) too short for overlap ({overlapped_frames}) — full re-decode')
+            else:
+                print(f'        First decode or checkpoint resume — decoding all latent frames')
             history_pixels = vae_decode_safe(real_history_latents, vae, unload_fn=_emergency_unload).cpu()
             print(f'        Decoded pixel shape: {history_pixels.shape}')
             print(f'        Pixel frames: {history_pixels.shape[2]}, Resolution: {history_pixels.shape[3]}x{history_pixels.shape[4]}')
         else:
-            section_latent_frames = (LATENT_WINDOW_SIZE * 2 + 1) if is_last_section else (LATENT_WINDOW_SIZE * 2)
-            overlapped_frames = LATENT_WINDOW_SIZE * 4 - 3
             print(f'        Decoding section: {section_latent_frames} latent frames')
             print(f'        Overlap with previous: {overlapped_frames} pixel frames (for smooth blending)')
             current_pixels = vae_decode_safe(real_history_latents[:, :, :section_latent_frames], vae, unload_fn=_emergency_unload).cpu()
